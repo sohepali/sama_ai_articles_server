@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -26,7 +27,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    or_,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 try:
@@ -97,36 +100,26 @@ class ArticleSource(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
-    articles = relationship("Article", back_populates="source")
-
 
 class Article(Base):
-    __tablename__ = "sama_articles"
-    __table_args__ = (UniqueConstraint("canonical_url", name="uq_sama_articles_canonical_url"),)
+    __tablename__ = "news_articles"
+    __table_args__ = {"extend_existing": True}
 
-    id = Column(Integer, primary_key=True)
-    source_id = Column(Integer, ForeignKey("sama_article_sources.id"), nullable=True)
-    source_name = Column(String(255), index=True, nullable=False)
+    id = Column(BigInteger, primary_key=True)
+    source = Column(Text, index=True, nullable=False)
     title = Column(Text, nullable=False)
-    url = Column(Text, nullable=True)
-    canonical_url = Column(Text, nullable=False)
-    published_at = Column(DateTime, nullable=True)
-    published_text = Column(String(255), nullable=True)
-    collected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    raw_html = Column(Text, nullable=True)
-    content = Column(Text, nullable=True)
+    url = Column(Text, index=True, nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
     summary = Column(Text, nullable=True)
+    content = Column(Text, nullable=True)
+    image_url = Column(Text, nullable=True)
+    raw = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    is_full_content = Column(Boolean, default=False)
     content_length = Column(Integer, default=0)
-    extraction_status = Column(String(50), default="partial", index=True)
-    extractor_used = Column(String(80), nullable=True)
-    fetch_error = Column(Text, nullable=True)
-    country_tags = Column(Text, nullable=True)
-    language = Column(String(20), nullable=True)
-    approved = Column(Boolean, default=True, index=True)
-    metadata_json = Column(Text, nullable=True)
+    scraped_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    source = relationship("ArticleSource", back_populates="articles")
     documents = relationship("ArticleDocument", back_populates="article", cascade="all, delete-orphan")
 
 
@@ -135,7 +128,7 @@ class ArticleDocument(Base):
     __table_args__ = (UniqueConstraint("article_id", "url", name="uq_sama_article_documents_article_url"),)
 
     id = Column(Integer, primary_key=True)
-    article_id = Column(Integer, ForeignKey("sama_articles.id"), nullable=False)
+    article_id = Column(BigInteger, ForeignKey("news_articles.id"), nullable=False)
     url = Column(Text, nullable=False)
     filename = Column(Text, nullable=True)
     content_type = Column(String(120), nullable=True)
@@ -344,6 +337,24 @@ def get_or_create_source(db: Session, source_name: str, source_type: str = "json
     return source
 
 
+def json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value or {}, ensure_ascii=False, default=str))
+
+
+def article_raw(article: Article) -> Dict[str, Any]:
+    return article.raw if isinstance(article.raw, dict) else {}
+
+
+def article_status(article: Article) -> str:
+    raw = article_raw(article)
+    return clean_text(raw.get("extraction_status")) or ("success" if article.is_full_content else "partial")
+
+
+def article_country_tags(article: Article) -> str:
+    raw = article_raw(article)
+    return clean_text(raw.get("country_tags"))
+
+
 def upsert_article_record(
     db: Session,
     source: ArticleSource,
@@ -361,38 +372,50 @@ def upsert_article_record(
     metadata: Optional[Dict[str, Any]],
 ) -> Tuple[Article, bool]:
     canonical_url = canonicalize_url(url)
-    article = db.query(Article).filter(Article.canonical_url == canonical_url).first()
+    article = (
+        db.query(Article)
+        .filter(or_(Article.url == url, Article.url == canonical_url))
+        .order_by(Article.updated_at.desc())
+        .first()
+    )
     created = False
-    approved = status == "success" or (status == "partial" and (APPROVE_PARTIAL or source.approve_by_default))
     if not article:
         article = Article(
-            source=source,
-            source_name=source.name,
+            source=source.name,
             title=title,
             url=url,
-            canonical_url=canonical_url,
-            collected_at=utc_now(),
+            created_at=utc_now(),
+            scraped_at=utc_now(),
         )
         db.add(article)
         created = True
 
-    article.source = source
-    article.source_name = source.name
+    raw_payload = json_safe(metadata)
+    raw_payload.update(
+        {
+            "canonical_url": canonical_url,
+            "published_text": published_text,
+            "extraction_status": status,
+            "extractor_used": extractor_used,
+            "fetch_error": fetch_error,
+            "country_tags": country_tags or infer_country_tags(f"{title} {content}"),
+            "source_record_id": source.id,
+        }
+    )
+    image_url = clean_text(first_value(metadata or {}, "image_url", "image", "thumbnail", "media_url"))
+
+    article.source = source.name
     article.title = title or article.title
     article.url = url or article.url
     article.published_at = published_at or article.published_at
-    article.published_text = published_text or article.published_text
-    article.raw_html = raw_html or article.raw_html
-    article.content = content or article.content
     article.summary = summary or article.summary
+    article.content = content or article.content
+    article.image_url = image_url or article.image_url
+    article.raw = raw_payload
     article.content_length = len(article.content or "")
-    article.extraction_status = status
-    article.extractor_used = extractor_used
-    article.fetch_error = fetch_error
-    article.country_tags = country_tags or infer_country_tags(f"{title} {content}")
-    article.approved = approved
+    article.is_full_content = status == "success"
     article.updated_at = utc_now()
-    article.metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    article.scraped_at = utc_now()
     db.flush()
     return article, created
 
@@ -633,7 +656,7 @@ def dashboard(_: None = Depends(require_admin), db: Session = Depends(get_db)) -
         for s in sources
     )
     article_rows = "".join(
-        f"<tr><td>{a.source_name}</td><td>{a.title}</td><td>{a.extraction_status}</td><td>{a.content_length}</td></tr>"
+        f"<tr><td>{a.source}</td><td>{a.title}</td><td>{article_status(a)}</td><td>{a.content_length}</td></tr>"
         for a in articles
     )
     return f"""
@@ -835,11 +858,11 @@ def list_admin_articles(
     source: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     query = db.query(Article)
-    if status:
-        query = query.filter(Article.extraction_status == status)
     if source:
-        query = query.filter(Article.source_name == source)
+        query = query.filter(Article.source == source)
     articles = query.order_by(Article.updated_at.desc()).limit(limit).all()
+    if status:
+        articles = [article for article in articles if article_status(article) == status]
     return {"articles": [article_to_api(article, include_content=False) for article in articles]}
 
 
@@ -866,17 +889,19 @@ def list_runs(_: None = Depends(require_admin), db: Session = Depends(get_db), l
 
 
 def article_to_api(article: Article, include_content: bool = True) -> Dict[str, Any]:
+    raw = article_raw(article)
+    published_text = clean_text(raw.get("published_text"))
     data = {
         "id": article.id,
-        "Source": article.source_name,
+        "Source": article.source,
         "Title": article.title,
-        "Date": article.published_at.date().isoformat() if article.published_at else article.published_text,
+        "Date": article.published_at.date().isoformat() if article.published_at else published_text,
         "URL": article.url,
-        "Extraction_Status": article.extraction_status,
+        "Extraction_Status": article_status(article),
         "Content_Length": article.content_length,
-        "Country_Tags": article.country_tags,
+        "Country_Tags": article_country_tags(article),
         "Updated_At": article.updated_at.isoformat() if article.updated_at else None,
-        "Scraped_At": article.collected_at.isoformat() if article.collected_at else None,
+        "Scraped_At": article.scraped_at.isoformat() if article.scraped_at else None,
         "Document_Count": len(article.documents or []),
     }
     if include_content:
@@ -894,15 +919,21 @@ def sync_articles(
     source: Optional[str] = Query(None),
     country: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
-    query = db.query(Article).filter(Article.approved.is_(True))
+    query = db.query(Article)
     if since:
         since_dt, _ = parse_datetime(since)
         if since_dt:
             query = query.filter(Article.updated_at > since_dt)
     if source:
-        query = query.filter(Article.source_name == source)
+        query = query.filter(Article.source == source)
     if country:
-        query = query.filter(Article.country_tags.ilike(f"%{country}%"))
+        query = query.filter(
+            or_(
+                Article.title.ilike(f"%{country}%"),
+                Article.summary.ilike(f"%{country}%"),
+                Article.content.ilike(f"%{country}%"),
+            )
+        )
     articles = query.order_by(Article.updated_at.desc()).limit(limit).all()
     return {
         "ok": True,
@@ -914,7 +945,7 @@ def sync_articles(
 
 @app.get("/articles/{article_id}")
 def get_article(article_id: int, _: None = Depends(require_sync_token), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    article = db.query(Article).filter(Article.id == article_id, Article.approved.is_(True)).first()
+    article = db.query(Article).filter(Article.id == article_id).first()
     if not article:
         raise HTTPException(status_code=404, detail="Article not found.")
     data = article_to_api(article)

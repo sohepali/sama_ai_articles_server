@@ -4,18 +4,45 @@ Standalone FastAPI server for collecting, storing, and syncing articles for SAMA
 
 This server is intentionally separate from the license/admin server. It uses its own PostgreSQL database and its own API tokens.
 
+The main article table is:
+
+```text
+public.news_articles
+```
+
+This is the same table that n8n can write to. The Render server writes to this table too, using URL-based upsert logic to avoid creating repeated rows for the same article.
+
 ## What it stores
 
 - Source name and source configuration
 - Article title, URL, canonical URL, source, dates
-- Raw HTML when fetched by the backend
+- Raw import/extraction metadata in `raw`
 - Full extracted article text
 - Summary text when provided by RSS/n8n
-- Extraction status: `success`, `partial`, or `failed`
-- Country tags
+- Extraction status inside `raw.extraction_status`
+- Country tags inside `raw.country_tags`
 - Downloaded PDF/Word attachments as PostgreSQL binary data
 - Extracted text from PDF/Word attachments
 - Ingestion run history
+
+Expected `news_articles` columns:
+
+```text
+id
+source
+title
+url
+published_at
+summary
+content
+image_url
+raw
+created_at
+updated_at
+is_full_content
+content_length
+scraped_at
+```
 
 ## Render setup
 
@@ -168,4 +195,3 @@ Open:
 ```text
 http://127.0.0.1:8000/health
 ```
-
