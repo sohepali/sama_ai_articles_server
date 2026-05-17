@@ -495,34 +495,56 @@ def extract_document_text(file_bytes: bytes, filename: str, content_type: str) -
     return ""
 
 
+def discover_from_source_page(source: ArticleSource) -> List[Dict[str, Any]]:
+    if not source.source_page_url:
+        return []
+    html = fetch_html(source.source_page_url)
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen = set()
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(source.source_page_url, anchor["href"])
+        title = clean_text(anchor.get_text(" "))
+        if "reliefweb.int" in source.source_page_url and "reliefweb.int/report/" not in href:
+            continue
+        if not title or not href.startswith("http"):
+            continue
+        canonical = canonicalize_url(href)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        items.append({"title": title, "url": href, "published": "", "summary": ""})
+        if len(items) >= MAX_ARTICLES_PER_SOURCE:
+            break
+    return items
+
+
 def discover_urls(source: ArticleSource) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     if source.rss_url:
         feed = feedparser.parse(source.rss_url)
-        for entry in feed.entries[:MAX_ARTICLES_PER_SOURCE]:
+        for entry in getattr(feed, "entries", [])[:MAX_ARTICLES_PER_SOURCE]:
+            url = clean_text(entry.get("link") or entry.get("id"))
+            title = clean_text(entry.get("title"))
+            if not url or not title:
+                continue
             items.append(
                 {
-                    "title": entry.get("title") or "",
-                    "url": entry.get("link") or entry.get("id") or "",
+                    "title": title,
+                    "url": url,
                     "published": entry.get("published") or entry.get("updated") or "",
                     "summary": entry.get("summary") or "",
                 }
             )
+        if not items and source.source_page_url:
+            items = discover_from_source_page(source)
     elif source.sitemap_url:
         html = fetch_html(source.sitemap_url)
         soup = BeautifulSoup(html, "xml")
         for loc in soup.find_all("loc")[:MAX_ARTICLES_PER_SOURCE]:
             items.append({"title": "", "url": loc.get_text(strip=True), "published": "", "summary": ""})
     elif source.source_page_url:
-        html = fetch_html(source.source_page_url)
-        soup = BeautifulSoup(html, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            href = urljoin(source.source_page_url, anchor["href"])
-            title = clean_text(anchor.get_text(" "))
-            if title and href.startswith("http"):
-                items.append({"title": title, "url": href, "published": "", "summary": ""})
-            if len(items) >= MAX_ARTICLES_PER_SOURCE:
-                break
+        items = discover_from_source_page(source)
     return items
 
 
@@ -736,7 +758,13 @@ def list_sources(_: None = Depends(require_admin), db: Session = Depends(get_db)
 def seed_sources(_: None = Depends(require_admin), db: Session = Depends(get_db)) -> Dict[str, Any]:
     defaults = [
         SourceIn(name="UN News", source_type="rss", rss_url="https://news.un.org/feed/subscribe/en/news/all/rss.xml"),
-        SourceIn(name="ReliefWeb", source_type="rss", rss_url="https://reliefweb.int/updates/rss.xml"),
+        SourceIn(
+            name="ReliefWeb",
+            source_type="rss",
+            rss_url="https://reliefweb.int/updates/rss.xml",
+            source_page_url="https://reliefweb.int/updates",
+            extractor_type="reliefweb_public",
+        ),
         SourceIn(name="BBC World", source_type="rss", rss_url="https://feeds.bbci.co.uk/news/world/rss.xml"),
         SourceIn(name="Al Jazeera", source_type="rss", rss_url="https://www.aljazeera.com/xml/rss/all.xml"),
         SourceIn(name="The New Humanitarian", source_type="rss", rss_url="https://www.thenewhumanitarian.org/rss.xml"),
@@ -745,12 +773,16 @@ def seed_sources(_: None = Depends(require_admin), db: Session = Depends(get_db)
     for source_in in defaults:
         existing = db.query(ArticleSource).filter(ArticleSource.name == source_in.name).first()
         if existing:
+            if source_in.name == "ReliefWeb" and not existing.source_page_url:
+                existing.source_page_url = "https://reliefweb.int/updates"
+                existing.extractor_type = "reliefweb_public"
             continue
         source = ArticleSource(
             name=source_in.name,
             source_type=source_in.source_type,
             rss_url=source_in.rss_url,
-            extractor_type="generic",
+            source_page_url=source_in.source_page_url,
+            extractor_type=source_in.extractor_type,
             active=True,
             approve_by_default=True,
         )
