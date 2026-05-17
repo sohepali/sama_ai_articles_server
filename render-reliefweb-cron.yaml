@@ -1,0 +1,26 @@
+services:
+  - type: cron
+    name: sama-ai-reliefweb-hourly
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python reliefweb_hourly_job.py
+    schedule: "0 * * * *"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RELIEFWEB_SOURCE_NAME
+        value: ReliefWeb
+      - key: RELIEFWEB_RSS_URL
+        value: https://reliefweb.int/updates/rss.xml
+      - key: RELIEFWEB_LISTING_URL
+        value: https://reliefweb.int/updates
+      - key: RELIEFWEB_MAX_ARTICLES
+        value: "50"
+      - key: NEWS_MIN_FULL_CHARS
+        value: "600"
+      - key: NEWS_MAX_DOCUMENTS_PER_ARTICLE
+        value: "3"
+      - key: NEWS_MAX_DOCUMENT_BYTES
+        value: "20971520"
+
